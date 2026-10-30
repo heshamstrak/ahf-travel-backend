@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+# Local InstaPay receipt storage (Milestone 5's LocalFileStorage). Never committed; a production
+# deployment points PAYMENT_PROOF_DIR at mounted/object storage instead.
+var/
+.env
+.env.*
+!.env.example
+*.log

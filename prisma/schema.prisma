@@ -1,0 +1,1059 @@
+// V1 schema proposal for review. Not migrated.
+//
+// Conventions
+// - Money is always a Decimal amount paired with a `currency` column (ISO 4217, CHAR(3)).
+//   Nothing in the schema assumes the platform is EGP-only.
+// - Content rows that humans author carry createdById / updatedById (plain UUIDs, no FK,
+//   so anonymising a user never breaks content history). Money or inventory rows do NOT:
+//   their changes are recorded in AuditEvent with before/after snapshots.
+// - CHECK constraints listed in comments must be added in generated migration SQL.
+//
+// Deferred to V1.1+ (documented in ARCHITECTURE.md, not in this file):
+//   Review, PackageComponent, CarRate, TransferDistanceTariff, Traveler.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums (27) ----------
+
+enum Role {
+  CUSTOMER
+  SUPPORT
+  CONTENT_EDITOR
+  FINANCE
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum Language {
+  EN
+  AR
+}
+
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ProductType {
+  HOTEL
+  TOUR
+  CAR
+  TRANSFER
+  PACKAGE
+}
+
+enum AuthTokenType {
+  REFRESH
+  VERIFY_EMAIL
+  PASSWORD_RESET
+}
+
+enum LocationType {
+  AIRPORT
+  CAR_BRANCH
+  ZONE
+}
+
+enum MediaSource {
+  UPLOAD
+  IMPORTED_EXTERNAL
+}
+
+enum MediaStatus {
+  PROCESSING
+  READY
+  REJECTED
+}
+
+enum MediaOwnerType {
+  DESTINATION
+  HOTEL
+  ROOM
+  TOUR
+  CAR_MODEL
+  TRANSFER_VEHICLE_CLASS
+  PACKAGE
+  PAYMENT_PROOF // Milestone 5: InstaPay transfer receipts. Never read by the public catalogue media
+  // endpoints (they only ever query the owner types above) — access is gated separately, by booking
+  // ownership or admin role, in the payments module.
+  SITE_BRANDING // Logo, favicon, header and hero background images. ownerId is a fixed per-slot
+  // constant (see admin/settings/branding-slots.ts), not a real catalogue row — there is nothing
+  // else for a site-wide image to belong to.
+}
+
+enum PropertyType {
+  HOTEL
+  RESORT
+  APARTMENT
+  VILLA
+}
+
+enum MealPlan {
+  ROOM_ONLY
+  BREAKFAST
+  HALF_BOARD
+  FULL_BOARD
+  ALL_INCLUSIVE
+}
+
+// How a package price is multiplied.
+enum PricingBasis {
+  PER_PERSON // basePrice × travellers (+ singleSupplement when travelling alone, + childPrice for children)
+  PER_ROOM // basePrice × rooms at base occupancy (+ extraPersonPrice per additional occupant)
+  PER_PACKAGE // flat basePrice for the group up to maxTravellers (+ extraPersonPrice beyond)
+}
+
+enum TourCategory {
+  HISTORY_CULTURE
+  DINING_ENTERTAINMENT
+  WATER_ACTIVITIES
+  SIGHTSEEING
+}
+
+enum SessionStatus {
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
+enum CarCategory {
+  ECONOMY
+  COMPACT
+  SUV
+  PREMIUM_SUV
+  LUXURY
+}
+
+enum Transmission {
+  AUTOMATIC
+  MANUAL
+}
+
+enum TransferVehicleType {
+  SEDAN
+  SUV
+  PREMIUM
+  VAN
+  MINIBUS
+}
+
+enum BudgetTier {
+  BUDGET
+  MID
+  LUXURY
+}
+
+enum PricingRuleKind {
+  TAX
+  FEE
+  SURCHARGE
+  DISCOUNT // reserved; no V1 rule uses it
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  EXPIRED
+}
+
+enum BookingItemStatus {
+  HELD
+  CONFIRMED
+  CANCELLED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PENDING
+  PAID
+  PAY_LATER
+  PARTIALLY_REFUNDED
+  REFUNDED
+  FAILED
+}
+
+enum PaymentMethod {
+  CARD // reserved: no V1 gateway integration (see ARCHITECTURE section 23)
+  PAY_LATER // reserved: not offered standalone in V1; CASH is V1's "pay later" method
+  CASH // pay-on-confirmation; V1 treats as collected later, never PAID merely from confirming
+  INSTAPAY // manual transfer, verified by an admin from a submitted reference and/or receipt
+}
+
+enum PaymentState {
+  PENDING // CARD: initiated: CASH: confirmed booking, money not yet collected
+  REQUIRES_ACTION
+  PENDING_VERIFICATION // INSTAPAY: customer submitted a reference/receipt, awaiting admin review
+  SUCCEEDED // payment verified/collected (approved InstaPay, or cash recorded as collected)
+  REJECTED // INSTAPAY only: admin rejected the submitted proof; booking stays PENDING_PAYMENT
+  FAILED
+  CANCELLED
+}
+
+enum RefundState {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum ActorType {
+  SYSTEM
+  USER
+  GUEST
+  ADMIN
+  PROVIDER
+}
+
+// ---------- Identity (2 models) ----------
+
+model User {
+  id               String     @id @default(uuid()) @db.Uuid
+  email            String     @unique @db.VarChar(254) // stored lowercase
+  passwordHash     String     @db.VarChar(255) // argon2id
+  firstName        String     @db.VarChar(80)
+  lastName         String     @db.VarChar(80)
+  phone            String?    @db.VarChar(20) // E.164
+  countryCode      String?    @db.Char(2) // ISO 3166-1 alpha-2
+  language         Language   @default(EN)
+  currency         String     @default("EGP") @db.Char(3)
+  role             Role       @default(CUSTOMER)
+  status           UserStatus @default(ACTIVE)
+  emailVerifiedAt  DateTime?
+  failedLoginCount Int        @default(0)
+  lockedUntil      DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+  deletedAt        DateTime?
+
+  tokens    AuthToken[]
+  bookings  Booking[]
+  favorites Favorite[]
+
+  @@index([role, status])
+}
+
+// Refresh tokens (rotating, hashed), email verification and password reset tokens.
+model AuthToken {
+  id           String        @id @default(uuid()) @db.Uuid
+  userId       String        @db.Uuid
+  type         AuthTokenType
+  tokenHash    String        @unique @db.Char(64)
+  familyId     String?       @db.Uuid // REFRESH only: reuse of a rotated token revokes the family
+  replacedById String?       @db.Uuid
+  userAgent    String?       @db.VarChar(255)
+  ipAddress    String?       @db.VarChar(45)
+  expiresAt    DateTime
+  usedAt       DateTime?
+  revokedAt    DateTime?
+  createdAt    DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type, revokedAt])
+  @@index([familyId])
+}
+
+// ---------- Platform configuration (2 models) ----------
+
+// Runtime-configurable platform values (hold duration, quote TTL, base currency,
+// display currencies, pay-later eligibility). Values are read at the moment they are used
+// and copied onto the booking/quote, so changing a setting never rewrites history.
+model Setting {
+  key         String   @id @db.VarChar(80)
+  value       Json
+  updatedById String?  @db.Uuid
+  updatedAt   DateTime @updatedAt
+}
+
+// Tax, fee, surcharge and (reserved) discount rules. No rate is hard-coded in the code base.
+model PricingRule {
+  id           String          @id @default(uuid()) @db.Uuid
+  code         String          @unique @db.VarChar(60)
+  kind         PricingRuleKind
+  label        String          @db.VarChar(120)
+  productType  ProductType? // null = all products
+  percent      Decimal?        @db.Decimal(7, 4) // e.g. 0.1400 = 14%
+  flatAmount   Decimal?        @db.Decimal(12, 2)
+  flatCurrency String?         @db.Char(3)
+  conditions   Json? // e.g. {"driverAgeBelow": 25, "perDay": true}
+  priority     Int             @default(0)
+  isActive     Boolean         @default(true)
+  validFrom    DateTime        @db.Date
+  validTo      DateTime?       @db.Date
+  createdById  String?         @db.Uuid
+  updatedById  String?         @db.Uuid
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  // CHECK (percent IS NOT NULL OR flatAmount IS NOT NULL)
+  // CHECK (flatAmount IS NULL OR flatCurrency IS NOT NULL)
+
+  @@index([isActive, productType, validFrom])
+}
+
+// Cross-currency conversion snapshot source. V1 only uses base EGP -> display currencies.
+model ExchangeRate {
+  baseCurrency  String   @db.Char(3)
+  quoteCurrency String   @db.Char(3)
+  rate          Decimal  @db.Decimal(18, 8) // 1 baseCurrency = rate quoteCurrency
+  source        String   @db.VarChar(60)
+  fetchedAt     DateTime
+
+  @@id([baseCurrency, quoteCurrency])
+}
+
+// ---------- Geography and media (3 models) ----------
+
+model Destination {
+  id          String        @id @default(uuid()) @db.Uuid
+  slug        String        @unique @db.VarChar(80)
+  name        String        @db.VarChar(120)
+  nameAr      String?       @db.VarChar(120)
+  countryCode String        @db.Char(2)
+  description String?       @db.Text
+  isFeatured  Boolean       @default(false)
+  sortOrder   Int           @default(0)
+  status      ContentStatus @default(DRAFT)
+  createdById String?       @db.Uuid
+  updatedById String?       @db.Uuid
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  deletedAt   DateTime?
+
+  locations Location[]
+  hotels    Hotel[]
+  tours     Tour[]
+  packages  Package[]
+
+  @@index([status, isFeatured, sortOrder])
+}
+
+// Airports, car branches and transfer zones. Replaces free-text pick-up/drop-off.
+model Location {
+  id            String        @id @default(uuid()) @db.Uuid
+  type          LocationType
+  code          String?       @unique @db.VarChar(10) // IATA for airports
+  name          String        @db.VarChar(160)
+  destinationId String        @db.Uuid
+  latitude      Decimal?      @db.Decimal(9, 6)
+  longitude     Decimal?      @db.Decimal(9, 6)
+  status        ContentStatus @default(PUBLISHED)
+  createdById   String?       @db.Uuid
+  updatedById   String?       @db.Uuid
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  deletedAt     DateTime?
+
+  destination  Destination    @relation(fields: [destinationId], references: [id])
+  carInventory CarInventory[]
+  carBookings  BookingItem[]  @relation("CarPickupLocation")
+  transferFrom TransferRate[] @relation("TransferOrigin")
+  transferTo   TransferRate[] @relation("TransferDestination")
+
+  @@index([type, destinationId, status])
+}
+
+// One table for all images/videos. Replaces Media + MediaLink.
+model Media {
+  id           String         @id @default(uuid()) @db.Uuid
+  ownerType    MediaOwnerType
+  ownerId      String         @db.Uuid // owner integrity checked in the service layer
+  storageKey   String         @unique @db.VarChar(512) // originals and variants live in object storage
+  variants     Json // { "400": "key", "800": "key", "1600": "key" } (webp/avif)
+  mimeType     String         @db.VarChar(40)
+  width        Int
+  height       Int
+  sizeBytes    Int
+  altText      String         @db.VarChar(255)
+  source       MediaSource    @default(UPLOAD)
+  sourceUrl    String?        @db.VarChar(512)
+  attribution  String?        @db.VarChar(512)
+  licenseCode  String?        @db.VarChar(40)
+  status       MediaStatus    @default(PROCESSING)
+  isCover      Boolean        @default(false)
+  sortOrder    Int            @default(0)
+  uploadedById String?        @db.Uuid
+  createdAt    DateTime       @default(now())
+  deletedAt    DateTime?
+
+  @@index([ownerType, ownerId, sortOrder])
+}
+
+model CancellationPolicy {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String   @unique @db.VarChar(40)
+  name        String   @db.VarChar(120)
+  description String   @db.Text
+  rules       Json // [{ "hoursBeforeStart": 48, "refundPercent": 100 }, ...]
+  createdById String?  @db.Uuid
+  updatedById String?  @db.Uuid
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  ratePlans RatePlan[]
+  tours     Tour[]
+  carModels CarModel[]
+  packages  Package[]
+}
+
+// ---------- Hotels (4 models) ----------
+
+model Hotel {
+  id                String        @id @default(uuid()) @db.Uuid
+  slug              String        @unique @db.VarChar(120)
+  name              String        @db.VarChar(160)
+  destinationId     String        @db.Uuid
+  propertyType      PropertyType
+  starRating        Int // CHECK BETWEEN 1 AND 5
+  addressLine       String        @db.VarChar(255)
+  latitude          Decimal?      @db.Decimal(9, 6)
+  longitude         Decimal?      @db.Decimal(9, 6)
+  description       String        @db.Text
+  checkInTime       String        @db.VarChar(5) // "14:00", local Africa/Cairo
+  checkOutTime      String        @db.VarChar(5)
+  amenities         String[] // catalogue codes, GIN index; replaces HotelAmenity table
+  guestRatingAvg    Decimal       @default(0) @db.Decimal(3, 1) // set by import in V1
+  reviewCount       Int           @default(0)
+  fromPriceAmount   Decimal?      @db.Decimal(12, 2) // cached cheapest rate plan, refreshed by job
+  fromPriceCurrency String?       @db.Char(3)
+  status            ContentStatus @default(DRAFT)
+  createdById       String?       @db.Uuid
+  updatedById       String?       @db.Uuid
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  deletedAt         DateTime?
+
+  destination  Destination   @relation(fields: [destinationId], references: [id])
+  rooms        Room[]
+  bookingItems BookingItem[]
+
+  @@index([destinationId, status, fromPriceAmount])
+  @@index([status, starRating])
+  @@index([status, guestRatingAvg])
+  @@index([amenities], type: Gin)
+}
+
+model Room {
+  id            String        @id @default(uuid()) @db.Uuid
+  hotelId       String        @db.Uuid
+  code          String        @db.VarChar(40)
+  name          String        @db.VarChar(120)
+  bedType       String        @db.VarChar(80)
+  baseOccupancy Int // adults included in the base rate
+  maxAdults     Int
+  maxChildren   Int           @default(0)
+  sizeSqm       Int?
+  features      String[] // display labels
+  status        ContentStatus @default(DRAFT)
+  createdById   String?       @db.Uuid
+  updatedById   String?       @db.Uuid
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  deletedAt     DateTime?
+
+  hotel        Hotel           @relation(fields: [hotelId], references: [id])
+  ratePlans    RatePlan[]
+  inventory    RoomInventory[]
+  bookingItems BookingItem[]
+  // CHECK (baseOccupancy <= maxAdults)
+
+  @@unique([hotelId, code])
+}
+
+// Commercial product on a room: refundability, meal plan, cancellation policy and base price.
+model RatePlan {
+  id                   String        @id @default(uuid()) @db.Uuid
+  roomId               String        @db.Uuid
+  code                 String        @db.VarChar(40)
+  name                 String        @db.VarChar(120)
+  mealPlan             MealPlan      @default(ROOM_ONLY)
+  isRefundable         Boolean
+  cancellationPolicyId String        @db.Uuid
+  currency             String        @db.Char(3)
+  basePricePerNight    Decimal       @db.Decimal(12, 2) // for baseOccupancy adults
+  extraAdultPerNight   Decimal?      @db.Decimal(12, 2) // per adult above baseOccupancy
+  extraChildPerNight   Decimal?      @db.Decimal(12, 2)
+  status               ContentStatus @default(DRAFT)
+  createdById          String?       @db.Uuid
+  updatedById          String?       @db.Uuid
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  room               Room               @relation(fields: [roomId], references: [id])
+  cancellationPolicy CancellationPolicy @relation(fields: [cancellationPolicyId], references: [id])
+  rates              RoomRate[]
+  bookingItems       BookingItem[]
+
+  @@unique([roomId, code])
+}
+
+// Date-specific nightly price override. Missing row = RatePlan.basePricePerNight.
+// Money row: changes are audited via AuditEvent, not author columns.
+model RoomRate {
+  ratePlanId    String   @db.Uuid
+  date          DateTime @db.Date
+  currency      String   @db.Char(3)
+  pricePerNight Decimal  @db.Decimal(12, 2)
+  version       Int      @default(0)
+
+  ratePlan RatePlan @relation(fields: [ratePlanId], references: [id], onDelete: Cascade)
+
+  @@id([ratePlanId, date])
+}
+
+// Physical rooms of a type per night: the hotel availability counters.
+// CHECK (heldUnits >= 0 AND soldUnits >= 0 AND blockedUnits >= 0)
+// CHECK (soldUnits + heldUnits + blockedUnits <= totalUnits)
+model RoomInventory {
+  roomId       String   @db.Uuid
+  date         DateTime @db.Date
+  totalUnits   Int
+  heldUnits    Int      @default(0)
+  soldUnits    Int      @default(0)
+  blockedUnits Int      @default(0)
+  version      Int      @default(0)
+  updatedAt    DateTime @updatedAt
+
+  room Room @relation(fields: [roomId], references: [id])
+
+  @@id([roomId, date])
+  @@index([date])
+}
+
+// ---------- Tours (2 models) ----------
+
+model Tour {
+  id                   String        @id @default(uuid()) @db.Uuid
+  slug                 String        @unique @db.VarChar(120)
+  title                String        @db.VarChar(160)
+  category             TourCategory
+  destinationId        String        @db.Uuid
+  meetingPoint         String        @db.VarChar(255)
+  durationMinutes      Int
+  maxGroupSize         Int
+  languages            String[]
+  currency             String        @db.Char(3)
+  pricePerPerson       Decimal       @db.Decimal(12, 2)
+  overview             String        @db.Text
+  highlights           String[]
+  included             String[]
+  excluded             String[]
+  importantInfo        String[]
+  itinerary            Json // [{ "offsetMinutes": 0, "title", "description" }]; display only in V1
+  cancellationPolicyId String        @db.Uuid
+  guestRatingAvg       Decimal       @default(0) @db.Decimal(2, 1) // set by import in V1
+  reviewCount          Int           @default(0)
+  status               ContentStatus @default(DRAFT)
+  createdById          String?       @db.Uuid
+  updatedById          String?       @db.Uuid
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  deletedAt            DateTime?
+
+  destination        Destination        @relation(fields: [destinationId], references: [id])
+  cancellationPolicy CancellationPolicy @relation(fields: [cancellationPolicyId], references: [id])
+  sessions           TourSession[]
+  bookingItems       BookingItem[]
+
+  @@index([destinationId, status, category])
+}
+
+// A bookable departure: date AND time with capacity. Money override is audited.
+// CHECK (bookedUnits >= 0 AND heldUnits >= 0 AND bookedUnits + heldUnits <= capacity)
+model TourSession {
+  id               String        @id @default(uuid()) @db.Uuid
+  tourId           String        @db.Uuid
+  startsAt         DateTime      @db.Timestamptz(6)
+  capacity         Int
+  heldUnits        Int           @default(0)
+  bookedUnits      Int           @default(0)
+  priceOverride    Decimal?      @db.Decimal(12, 2)
+  overrideCurrency String?       @db.Char(3)
+  status           SessionStatus @default(OPEN)
+  version          Int           @default(0)
+
+  tour         Tour          @relation(fields: [tourId], references: [id])
+  bookingItems BookingItem[]
+
+  @@unique([tourId, startsAt])
+  @@index([tourId, status, startsAt])
+}
+
+// ---------- Cars (2 models) ----------
+
+model CarModel {
+  id                   String        @id @default(uuid()) @db.Uuid
+  slug                 String        @unique @db.VarChar(120)
+  brand                String        @db.VarChar(60)
+  name                 String        @db.VarChar(120)
+  category             CarCategory
+  transmission         Transmission
+  hasAirConditioning   Boolean       @default(true)
+  passengers           Int
+  bags                 Int
+  doors                Int
+  includedKmPerDay     Int
+  fuelPolicy           String        @default("FULL_TO_FULL") @db.VarChar(200)
+  minDriverAge         Int
+  currency             String        @db.Char(3)
+  pricePerDay          Decimal       @db.Decimal(12, 2)
+  depositAmount        Decimal       @db.Decimal(12, 2)
+  coverage             String[]
+  rentalConditions     String[]
+  pickupNotes          String?       @db.Text
+  cancellationPolicyId String        @db.Uuid
+  guestRatingAvg       Decimal       @default(0) @db.Decimal(2, 1)
+  reviewCount          Int           @default(0)
+  status               ContentStatus @default(DRAFT)
+  createdById          String?       @db.Uuid
+  updatedById          String?       @db.Uuid
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  deletedAt            DateTime?
+
+  cancellationPolicy CancellationPolicy @relation(fields: [cancellationPolicyId], references: [id])
+  inventory          CarInventory[]
+  bookingItems       BookingItem[]
+
+  @@index([status, category, transmission])
+  @@index([status, pricePerDay])
+}
+
+// Fleet units of a model at a branch for one day. Same-branch returns only in V1.
+// CHECK (heldUnits >= 0 AND bookedUnits >= 0 AND blockedUnits >= 0)
+// CHECK (bookedUnits + heldUnits + blockedUnits <= totalUnits)
+model CarInventory {
+  carModelId   String   @db.Uuid
+  locationId   String   @db.Uuid
+  date         DateTime @db.Date
+  totalUnits   Int
+  heldUnits    Int      @default(0)
+  bookedUnits  Int      @default(0)
+  blockedUnits Int      @default(0)
+  version      Int      @default(0)
+  updatedAt    DateTime @updatedAt
+
+  carModel CarModel @relation(fields: [carModelId], references: [id])
+  location Location @relation(fields: [locationId], references: [id])
+
+  @@id([carModelId, locationId, date])
+  @@index([locationId, date])
+}
+
+// ---------- Transfers (3 models) ----------
+
+model TransferVehicleClass {
+  id            String              @id @default(uuid()) @db.Uuid
+  code          TransferVehicleType @unique
+  name          String              @db.VarChar(120)
+  passengersMax Int
+  luggageMax    Int
+  features      String[]
+  isActive      Boolean             @default(true)
+  createdById   String?             @db.Uuid
+  updatedById   String?             @db.Uuid
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  rates    TransferRate[]
+  capacity TransferCapacity[]
+}
+
+// Fixed price for origin -> destination in one vehicle class. The bookable transfer product.
+// Money row: changes audited via AuditEvent.
+// CHECK (originLocationId <> destinationLocationId)
+model TransferRate {
+  id                    String    @id @default(uuid()) @db.Uuid
+  originLocationId      String    @db.Uuid
+  destinationLocationId String    @db.Uuid
+  vehicleClassId        String    @db.Uuid
+  amount                Decimal   @db.Decimal(12, 2)
+  currency              String    @db.Char(3)
+  durationMinutes       Int
+  // Seeded development values, not confirmed business pricing. Quote lines show this flag.
+  isDevPlaceholder      Boolean   @default(false)
+  validFrom             DateTime  @db.Date
+  validTo               DateTime? @db.Date
+  isActive              Boolean   @default(true)
+  version               Int       @default(0)
+
+  origin       Location             @relation("TransferOrigin", fields: [originLocationId], references: [id])
+  destination  Location             @relation("TransferDestination", fields: [destinationLocationId], references: [id])
+  vehicleClass TransferVehicleClass @relation(fields: [vehicleClassId], references: [id])
+  bookingItems BookingItem[]
+
+  @@unique([originLocationId, destinationLocationId, vehicleClassId, validFrom])
+}
+
+// Vehicles of a class available per day. A transfer consumes one unit on its pickup date.
+// CHECK (heldUnits >= 0 AND bookedUnits >= 0 AND bookedUnits + heldUnits <= totalUnits)
+model TransferCapacity {
+  vehicleClassId String   @db.Uuid
+  date           DateTime @db.Date
+  totalUnits     Int
+  heldUnits      Int      @default(0)
+  bookedUnits    Int      @default(0)
+  version        Int      @default(0)
+
+  vehicleClass TransferVehicleClass @relation(fields: [vehicleClassId], references: [id])
+
+  @@id([vehicleClassId, date])
+}
+
+// ---------- Packages (2 models) ----------
+
+model Package {
+  id                   String        @id @default(uuid()) @db.Uuid
+  slug                 String        @unique @db.VarChar(120)
+  title                String        @db.VarChar(160)
+  overview             String        @db.Text
+  durationNights       Int
+  durationDays         Int
+  budgetTier           BudgetTier
+  pricingBasis         PricingBasis
+  currency             String        @db.Char(3)
+  basePrice            Decimal       @db.Decimal(12, 2)
+  singleSupplement     Decimal?      @db.Decimal(12, 2) // PER_PERSON, traveller alone
+  childPrice           Decimal?      @db.Decimal(12, 2) // PER_PERSON, children
+  extraPersonPrice     Decimal?      @db.Decimal(12, 2) // PER_ROOM / PER_PACKAGE beyond base
+  minTravellers        Int           @default(1)
+  maxTravellers        Int
+  cancellationPolicyId String        @db.Uuid
+  itinerary            Json // [{ "day", "title", "description" }]
+  includes             Json // hotel/tour/transfer descriptions; references deferred to V1.1
+  included             String[]
+  excluded             String[]
+  status               ContentStatus @default(DRAFT)
+  createdById          String?       @db.Uuid
+  updatedById          String?       @db.Uuid
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  deletedAt            DateTime?
+
+  cancellationPolicy CancellationPolicy @relation(fields: [cancellationPolicyId], references: [id])
+  destinations       Destination[]
+  departures         PackageDeparture[]
+  // CHECK (minTravellers >= 1 AND minTravellers <= maxTravellers)
+  // CHECK (pricingBasis <> 'PER_PERSON' OR childPrice IS NULL OR childPrice >= 0)
+
+  @@index([status, budgetTier, durationNights])
+}
+
+// Allotment-based package date. Component stock (rooms, tours, vehicles) is sized by admins
+// to match maxTravellers in V1; automatic component reservation is V1.1.
+// CHECK (bookedTravellers >= 0 AND heldTravellers >= 0 AND bookedTravellers + heldTravellers <= capacity)
+model PackageDeparture {
+  id               String        @id @default(uuid()) @db.Uuid
+  packageId        String        @db.Uuid
+  startsOn         DateTime      @db.Date
+  capacity         Int
+  heldTravellers   Int           @default(0)
+  bookedTravellers Int           @default(0)
+  priceOverride    Decimal?      @db.Decimal(12, 2)
+  overrideCurrency String?       @db.Char(3)
+  status           SessionStatus @default(OPEN)
+  version          Int           @default(0)
+
+  package      Package       @relation(fields: [packageId], references: [id])
+  bookingItems BookingItem[]
+
+  @@unique([packageId, startsOn])
+  @@index([packageId, status, startsOn])
+}
+
+// ---------- Quotes ----------
+
+// Server-computed, immutable price snapshot. Booking creation accepts only a quote id.
+// Single use: consumedAt is set in the same transaction that creates the booking.
+model Quote {
+  id             String      @id @default(uuid()) @db.Uuid
+  userId         String?     @db.Uuid // null = guest quote, protected by guestTokenHash
+  guestTokenHash String?     @db.Char(64) // SHA-256 of the guest access token shown once at creation
+  productType    ProductType
+  productId      String      @db.Uuid // the sold unit: ratePlanId | tourSessionId | carModelId | transferRateId | packageDepartureId
+  request        Json // normalised selection (dates, guests, room, etc.) and product snapshot
+  lines          Json // every price line with its rule snapshot, rate and currency
+  currency       String      @db.Char(3)
+  subtotal       Decimal     @db.Decimal(12, 2) // gross product base, before discounts and surcharges
+  discount       Decimal     @default(0) @db.Decimal(12, 2)
+  surcharge      Decimal     @default(0) @db.Decimal(12, 2)
+  fee            Decimal     @db.Decimal(12, 2) // on the net amount (subtotal - discount + surcharge)
+  tax            Decimal     @db.Decimal(12, 2) // on the net amount
+  total          Decimal     @db.Decimal(12, 2)
+  displayCurrency String?    @db.Char(3) // presentation only; the legal total is in currency
+  displayFxRate   Decimal?   @db.Decimal(18, 8)
+  displayTotal    Decimal?   @db.Decimal(12, 2)
+  holdMinutes    Int // hold duration applied to this quote's booking, snapshot from Setting
+  expiresAt      DateTime
+  consumedAt     DateTime?
+  createdAt      DateTime    @default(now())
+
+  booking Booking?
+  // CHECK (total = subtotal - discount + surcharge + fee + tax)
+  // Immutable after creation: a trigger allows only consumedAt NULL -> timestamp (Milestone 4).
+
+  @@index([expiresAt])
+  @@index([userId, createdAt])
+}
+
+// ---------- Bookings (2 models) ----------
+
+model Booking {
+  id                         String         @id @default(uuid()) @db.Uuid
+  reference                  String         @unique @db.VarChar(12) // EB-XXXXX from a sequence, not Math.random
+  userId                     String?        @db.Uuid // null = guest checkout
+  quoteId                    String         @unique @db.Uuid // one booking per quote = natural idempotency
+  status                     BookingStatus  @default(PENDING_PAYMENT)
+  paymentStatus              PaymentStatus  @default(UNPAID)
+  paymentMethod              PaymentMethod?
+  currency                   String         @db.Char(3) // booking currency (settlement)
+  displayCurrency            String         @db.Char(3)
+  displayFxRate              Decimal?       @db.Decimal(18, 8) // currency -> displayCurrency, snapshot
+  subtotal                   Decimal        @db.Decimal(12, 2)
+  discount                   Decimal        @default(0) @db.Decimal(12, 2)
+  surcharge                  Decimal        @default(0) @db.Decimal(12, 2)
+  tax                        Decimal        @db.Decimal(12, 2)
+  fee                        Decimal        @db.Decimal(12, 2)
+  total                      Decimal        @db.Decimal(12, 2)
+  priceBreakdown             Json // immutable copy of quote lines (includes the surcharge line, if any)
+  cancellationPolicySnapshot Json // rules copied at booking time
+  customerFirstName          String         @db.VarChar(80)
+  customerLastName           String         @db.VarChar(80)
+  customerEmail              String         @db.VarChar(254)
+  customerPhone              String         @db.VarChar(20)
+  customerCountryCode        String         @db.Char(2)
+  specialRequests            String?        @db.Text
+  holdExpiresAt              DateTime? // set while PENDING_PAYMENT
+  holdMinutes                Int
+  confirmedAt                DateTime?
+  cancelledAt                DateTime?
+  cancelledByType            ActorType?
+  cancelledById              String?        @db.Uuid
+  cancelReason               String?        @db.VarChar(255)
+  createdAt                  DateTime       @default(now())
+  updatedAt                  DateTime       @updatedAt
+  version                    Int            @default(0)
+
+  user     User?         @relation(fields: [userId], references: [id])
+  quote    Quote         @relation(fields: [quoteId], references: [id])
+  items    BookingItem[]
+  payments Payment[]
+  refunds  Refund[]
+  // CHECK (total = subtotal - discount + surcharge + tax + fee)
+  // CHECK (holdExpiresAt IS NOT NULL OR status <> 'PENDING_PAYMENT')
+
+  @@index([userId, createdAt])
+  @@index([status, holdExpiresAt])
+  @@index([status, createdAt])
+  @@index([customerEmail, reference])
+}
+
+// One row per product in the order. Product-specific keys are nullable FKs; exactly the set
+// matching productType must be non-null (CHECK per product in migration SQL).
+model BookingItem {
+  id                 String            @id @default(uuid()) @db.Uuid
+  bookingId          String            @db.Uuid
+  productType        ProductType
+  productId          String            @db.Uuid // hotelId | tourId | carModelId | transferRateId | packageId
+  hotelId            String?           @db.Uuid
+  roomId             String?           @db.Uuid
+  ratePlanId         String?           @db.Uuid
+  tourId             String?           @db.Uuid
+  tourSessionId      String?           @db.Uuid
+  carModelId         String?           @db.Uuid
+  pickupLocationId   String?           @db.Uuid
+  transferRateId     String?           @db.Uuid
+  packageDepartureId String?           @db.Uuid
+  startsAt           DateTime          @db.Timestamptz(6)
+  endsAt             DateTime          @db.Timestamptz(6)
+  quantity           Int // rooms | participants | 1 car | 1 transfer | travellers
+  adults             Int?
+  children           Int?
+  details            Json // nights, rental days, driver age, passengers, luggage, flight number, notes
+  productSnapshot    Json // name, image, location text at booking time
+  currency           String            @db.Char(3)
+  unitPrice          Decimal           @db.Decimal(12, 2)
+  lineTotal          Decimal           @db.Decimal(12, 2)
+  status             BookingItemStatus @default(HELD)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  booking          Booking           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  hotel            Hotel?            @relation(fields: [hotelId], references: [id])
+  room             Room?             @relation(fields: [roomId], references: [id])
+  ratePlan         RatePlan?         @relation(fields: [ratePlanId], references: [id])
+  tour             Tour?             @relation(fields: [tourId], references: [id])
+  tourSession      TourSession?      @relation(fields: [tourSessionId], references: [id])
+  carModel         CarModel?         @relation(fields: [carModelId], references: [id])
+  pickupLocation   Location?         @relation("CarPickupLocation", fields: [pickupLocationId], references: [id])
+  transferRate     TransferRate?     @relation(fields: [transferRateId], references: [id])
+  packageDeparture PackageDeparture? @relation(fields: [packageDepartureId], references: [id])
+
+  @@index([bookingId])
+  @@index([productType, productId, status])
+  @@index([roomId, startsAt])
+  @@index([tourSessionId, status])
+  @@index([carModelId, pickupLocationId, startsAt])
+  @@index([transferRateId, startsAt])
+  @@index([packageDepartureId, status])
+}
+
+// ---------- Payments (3 models) ----------
+
+// Provider-agnostic. One row per attempt (a retry is a new Payment), so no PaymentAttempt table.
+// The card number never reaches this table: the provider's hosted fields return a token,
+// and we store only brand, last four digits and expiry.
+//
+// Milestone 5 (CASH / INSTAPAY): one row per attempt, same as a card retry — an InstaPay proof
+// resubmitted after a rejection is a new Payment row with its own idempotency key, so the rejected
+// attempt stays on record rather than being overwritten. `providerName`/`providerPaymentId` are
+// meaningless for a manual method and stay null; `transferReference`/`proofSubmittedAt` and the
+// review fields are meaningless for CARD/CASH and stay null there.
+// CHECK (status <> 'REJECTED' OR "rejectionReason" IS NOT NULL)
+// CHECK (method = 'INSTAPAY' OR status NOT IN ('PENDING_VERIFICATION', 'REJECTED'))
+model Payment {
+  id                String        @id @default(uuid()) @db.Uuid
+  bookingId         String        @db.Uuid
+  providerName      String?       @db.VarChar(40)
+  providerPaymentId String?       @db.VarChar(120)
+  idempotencyKey    String        @db.VarChar(100) // client-supplied per attempt (server-generated for CASH); matches IdempotencyKey.key's width
+  method            PaymentMethod
+  status            PaymentState  @default(PENDING)
+  amount            Decimal       @db.Decimal(12, 2)
+  currency          String        @db.Char(3)
+  cardBrand         String?       @db.VarChar(20)
+  cardLast4         String?       @db.Char(4)
+  cardExpMonth      Int?
+  cardExpYear       Int?
+  transferReference String?       @db.VarChar(120) // INSTAPAY: customer-supplied transfer/transaction reference
+  proofSubmittedAt  DateTime? // INSTAPAY: when the reference/receipt was submitted
+  reviewedAt        DateTime? // INSTAPAY: when an admin approved or rejected it
+  reviewedById      String?       @db.Uuid // admin actor id; no FK, same reasoning as cancelledById
+  rejectionReason   String?       @db.VarChar(255) // INSTAPAY: required when status = REJECTED
+  failureCode       String?       @db.VarChar(60)
+  failureMessage    String?       @db.VarChar(255)
+  succeededAt       DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  booking Booking  @relation(fields: [bookingId], references: [id])
+  refunds Refund[]
+  // No Prisma relation to Media: Media.ownerId is a polymorphic reference (checked in the service
+  // layer), the same pattern every other MediaOwnerType already uses. The proof row is looked up by
+  // { ownerType: PAYMENT_PROOF, ownerId: payment.id }.
+
+  @@unique([bookingId, idempotencyKey])
+  @@unique([providerName, providerPaymentId])
+  @@index([bookingId, status])
+  @@index([status, proofSubmittedAt])
+}
+
+model Refund {
+  id               String      @id @default(uuid()) @db.Uuid
+  bookingId        String      @db.Uuid
+  paymentId        String      @db.Uuid
+  amount           Decimal     @db.Decimal(12, 2)
+  currency         String      @db.Char(3)
+  reason           String      @db.VarChar(255)
+  status           RefundState @default(PENDING)
+  providerName     String?     @db.VarChar(40)
+  providerRefundId String?     @db.VarChar(120)
+  requestedById    String?     @db.Uuid // admin or null for policy-driven refunds
+  createdAt        DateTime    @default(now())
+  processedAt      DateTime?
+
+  booking Booking @relation(fields: [bookingId], references: [id])
+  payment Payment @relation(fields: [paymentId], references: [id])
+
+  @@unique([providerName, providerRefundId])
+  @@index([bookingId])
+}
+
+// Inbound provider webhooks stored before processing. Dedupe key = (provider, eventId).
+model WebhookEvent {
+  id              String    @id @default(uuid()) @db.Uuid
+  providerName    String    @db.VarChar(40)
+  providerEventId String    @db.VarChar(120)
+  eventType       String    @db.VarChar(80)
+  payload         Json
+  receivedAt      DateTime  @default(now())
+  processedAt     DateTime?
+  attempts        Int       @default(0)
+
+  @@unique([providerName, providerEventId])
+  @@index([processedAt])
+}
+
+// ---------- Customer ----------
+
+model Favorite {
+  userId      String      @db.Uuid
+  productType ProductType // HOTEL | TOUR | CAR | PACKAGE (transfers are not favouritable)
+  productId   String      @db.Uuid // polymorphic; validated in the service layer
+  createdAt   DateTime    @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, productType, productId])
+  @@index([productType, productId])
+}
+
+// ---------- Audit and events ----------
+
+// Append-only log for admin actions AND domain events (booking status, payment and refund
+// transitions, inventory and price changes, policy changes). Replaces BookingEvent and AuditLog.
+// Migration must REVOKE UPDATE/DELETE from the application role and add a trigger that rejects them.
+model AuditEvent {
+  id            BigInt    @id @default(autoincrement())
+  occurredAt    DateTime  @default(now())
+  actorType     ActorType
+  actorId       String?   @db.Uuid // no FK: survives account deletion
+  actorEmail    String?   @db.VarChar(254) // snapshot at event time
+  actorName     String?   @db.VarChar(160) // snapshot at event time
+  actorRole     String?   @db.VarChar(20) // snapshot at event time
+  action        String    @db.VarChar(80) // e.g. "booking.confirmed", "rate.updated", "inventory.adjusted"
+  aggregateType String    @db.VarChar(40) // e.g. "Booking", "RoomInventory"
+  aggregateId   String    @db.VarChar(80)
+  before        Json?
+  after         Json?
+  requestId     String?   @db.VarChar(64)
+  ipAddress     String?   @db.VarChar(45)
+
+  @@index([aggregateType, aggregateId, occurredAt])
+  @@index([actorId, occurredAt])
+  @@index([occurredAt])
+}
+
+// Request idempotency for mutating endpoints that must not repeat (booking creation, payment
+// session creation, cancellation). Inserted in the SAME transaction as the business change,
+// so a key row exists only if the operation committed. A replay returns the stored response.
+// Independent of Quote: a quote is a price snapshot with single-use semantics; this is request replay.
+model IdempotencyKey {
+  id             String   @id @default(uuid()) @db.Uuid
+  operation      String   @db.VarChar(40) // e.g. booking.create, payment.create
+  key            String   @db.VarChar(100) // client-supplied (UUIDv4 recommended)
+  requestHash    String   @db.Char(64) // SHA-256 of canonical request body
+  resourceType   String   @db.VarChar(40)
+  resourceId     String   @db.Uuid
+  responseStatus Int
+  responseBody   Json
+  createdAt      DateTime @default(now())
+  expiresAt      DateTime
+
+  @@unique([operation, key])
+  @@index([expiresAt])
+}
