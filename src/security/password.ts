@@ -1,20 +1,27 @@
-import * as argon2 from "argon2";
+import { randomBytes } from "node:crypto";
+import { argon2id, argon2Verify } from "hash-wasm";
 
-
-export function hashPassword(password: string): Promise<string> {
+// WASM Argon2id (hash-wasm), not the native `argon2` binding: prebuilt native binaries
+// require a glibc newer than some hosting runtimes ship, which crashes the process at
+// startup. hash-wasm has no native dependency and produces byte-identical PHC strings
+// (verified against node-argon2's output for the same salt/params), so existing hashes
+// keep verifying.
+export async function hashPassword(password: string): Promise<string> {
   // OWASP minimum for argon2id: 19 MiB memory, 2 iterations, 1 lane.
-  return argon2.hash(password, {
-    type: argon2.argon2id,
-    memoryCost: 19456,
-    timeCost: 2,
+  return argon2id({
+    password,
+    salt: randomBytes(16),
+    memorySize: 19456,
+    iterations: 2,
     parallelism: 1,
-    raw: false,
+    hashLength: 32,
+    outputType: "encoded",
   });
 }
 
 export async function verifyPassword(hash: string, password: string): Promise<boolean> {
   try {
-    return await argon2.verify(hash, password);
+    return await argon2Verify({ hash, password });
   } catch {
     return false;
   }
