@@ -7,6 +7,6 @@ assertTestDatabase(env.DATABASE_URL);
 
 const seed = spawnSync(process.execPath, ["node_modules/prisma/build/index.js", "db", "seed"], {
   stdio: "inherit",
-  env: { ...process.env, DATABASE_URL: env.DATABASE_URL },
+  env: { ...process.env, DATABASE_URL: env.DATABASE_URL, DIRECT_URL: env.DIRECT_URL ?? env.DATABASE_URL },
 });
 process.exit(seed.status ?? 1);

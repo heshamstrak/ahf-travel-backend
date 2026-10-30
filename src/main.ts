@@ -9,7 +9,7 @@ async function bootstrap(): Promise<void> {
   const config = loadConfig();
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
   configureApp(app, config);
-  await app.listen(config.port);
+  await app.listen(config.port, '0.0.0.0');
   Logger.log(`API listening on port ${config.port} (${config.nodeEnv})`, "Bootstrap");
 }
 

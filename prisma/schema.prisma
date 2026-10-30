@@ -15,9 +15,15 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// DATABASE_URL: Supabase's pooled (pgbouncer, transaction mode, port 6543) connection
+// string, used by the app at runtime and by `prisma migrate` to apply migrations
+// (append `?pgbouncer=true` when pointed at the pooler).
+// DIRECT_URL: Supabase's direct (non-pooled, port 5432) connection string, used by
+// `prisma migrate` for the advisory locks pgbouncer's transaction mode cannot hold.
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ---------- Enums (27) ----------
